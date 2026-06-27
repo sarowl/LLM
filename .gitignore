@@ -1,3 +1,6 @@
 .venv/
 .env/
 env/
+# .gitignore
+.env
+chromadb_index/

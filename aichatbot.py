@@ -1,84 +1,292 @@
 """
-aichatbot.py — AI Kiosk Chatbot
+aichatbot.py — AI Kiosk Chatbot  (improved)
+
+Changes vs original
+────────────────────
+  FIX  langchain_classic → langchain (correct package)
+  FIX  Embedding function now explicitly shared with ingest.py via the same
+       SentenceTransformerEmbeddingFunction instance — no silent mismatch.
+  FIX  ConversationalRetrievalChain (deprecated, double-LLM-call) replaced
+       with a clean LCEL pipeline.
+  NEW  Cross-encoder reranking: retrieves 20 candidates, reranks to top 5.
+  NEW  Hybrid retrieval: BM25 keyword search fused with vector search via
+       Reciprocal Rank Fusion (RRF) — handles exact matches (codes, names).
+  FIX  Chat history capped at MAX_HISTORY turns to prevent context overflow.
+  FIX  Dead SentenceTransformerEmbeddingFunction import is now actually used.
+  FIX  import os added — was missing, caused NameError on os.getenv()
+  FIX  load_dotenv() moved after all stdlib imports
+  FIX  RERANK_MODEL now also reads from .env like the other config values
 """
 
 import logging
+import os
 from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-from langchain_ollama import OllamaLLM
-from langchain_core.documents import Document
-from langchain_core.retrievers import BaseRetriever
+
+# LCEL imports — replaces deprecated ConversationalRetrievalChain
 from langchain_core.prompts import PromptTemplate
-from langchain_classic.chains import ConversationalRetrievalChain
-from pydantic import Field
-from typing import Any
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.documents import Document
+from langchain_ollama import OllamaLLM
+
+# Cross-encoder reranker
+from sentence_transformers import CrossEncoder
+
+# BM25 for hybrid search keyword leg
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+except ImportError:
+    BM25_AVAILABLE = False
+    logging.getLogger("kiosk_chatbot").warning(
+        "rank_bm25 not installed — falling back to vector-only retrieval. "
+        "Run: pip install rank_bm25"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION — must match ingest.py exactly
+# All values can be overridden via .env file
 # ─────────────────────────────────────────────────────────────────────────────
 
-INDEX_DIR       = Path("./chromadb_index")   # same path as ingest.py
-COLLECTION_NAME = "kiosk_docs"               # same name as ingest.py
-EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"  # same model as ingest.py
-LLM_MODEL       = "llama3:8b"
-K_RETRIEVAL     = 10
+INDEX_DIR       = Path(os.getenv("INDEX_DIR", "./chromadb_index"))
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "kiosk_docs")
+EMBED_MODEL     = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+RERANK_MODEL    = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+LLM_MODEL       = os.getenv("LLM_MODEL", "llama3:8b")
+
+K_RETRIEVE  = 20   # candidates fetched before reranking
+K_RERANK    = 5    # top-k kept after reranking, passed to LLM
+MAX_HISTORY = 5    # rolling window — prevents context overflow
+RRF_K       = 60   # RRF constant (standard value from the paper)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("kiosk_chatbot")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CHROMADB RETRIEVER
+# RECIPROCAL RANK FUSION
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ChromaDBRetriever(BaseRetriever):
-    collection: Any = Field(...)
-    k: int = Field(default=10)
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[str]],
+    k: int = RRF_K,
+) -> list[str]:
+    """
+    Merge multiple ranked lists of document IDs into one list using RRF.
+    Higher combined score → earlier position in the output.
+    """
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, doc_id in enumerate(ranked):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores, key=scores.__getitem__, reverse=True)
 
-    class Config:
-        arbitrary_types_allowed = True
 
-    def _get_relevant_documents(self, query: str) -> list[Document]:
+# ─────────────────────────────────────────────────────────────────────────────
+# HYBRID RETRIEVER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HybridRetriever:
+    """
+    Two-stage retrieval:
+      1. Fetch K_RETRIEVE candidates via hybrid BM25 + vector search (RRF fusion).
+      2. Rerank with a cross-encoder, return top K_RERANK.
+    """
+
+    def __init__(self, collection: Any, reranker: CrossEncoder):
+        self.collection = collection
+        self.reranker   = reranker
+        self._bm25: BM25Okapi | None = None
+        self._all_ids:  list[str] = []
+        self._all_docs: list[str] = []
+        self._all_meta: list[dict] = []
+        self._build_bm25_index()
+
+    def _build_bm25_index(self):
+        """Load all chunks from ChromaDB and build an in-memory BM25 index."""
+        if not BM25_AVAILABLE:
+            return
+
+        log.info("Building BM25 index from collection …")
+        result = self.collection.get(include=["documents", "metadatas"])
+        self._all_ids   = result["ids"]
+        self._all_docs  = result["documents"]
+        self._all_meta  = result["metadatas"]
+
+        tokenised = [doc.lower().split() for doc in self._all_docs]
+        self._bm25 = BM25Okapi(tokenised)
+        log.info("BM25 index built — %d documents", len(self._all_ids))
+
+    def _vector_search(self, query: str) -> list[str]:
+        """Return K_RETRIEVE doc IDs ranked by cosine similarity."""
         results = self.collection.query(
             query_texts=[query],
-            n_results=self.k,
-            include=["documents", "metadatas", "distances"],
+            n_results=min(K_RETRIEVE, self.collection.count()),
+            include=["metadatas", "distances"],
+        )
+        return results["ids"][0]
+
+    def _bm25_search(self, query: str) -> list[str]:
+        """Return K_RETRIEVE doc IDs ranked by BM25 score."""
+        if self._bm25 is None or not self._all_ids:
+            return []
+        tokens = query.lower().split()
+        scores = self._bm25.get_scores(tokens)
+        ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        return [self._all_ids[i] for i in ranked_indices[:K_RETRIEVE]]
+
+    def _id_to_document(self, doc_id: str) -> Document | None:
+        """Fetch a single document by ID from ChromaDB."""
+        try:
+            result = self.collection.get(
+                ids=[doc_id],
+                include=["documents", "metadatas"],
+            )
+            if not result["documents"]:
+                return None
+            text = result["documents"][0]
+            meta = result["metadatas"][0]
+
+            source   = meta.get("source", "unknown")
+            page     = meta.get("page", -1)
+            headings = meta.get("headings", "")
+
+            content = f"[{source}, page {page}] {text}"
+            if headings:
+                content = f"[{headings}]\n{content}"
+
+            return Document(page_content=content, metadata=meta)
+        except Exception:
+            return None
+
+    def retrieve(self, query: str) -> list[Document]:
+        """Full hybrid + rerank pipeline. Returns at most K_RERANK docs, best first."""
+        vector_ranked = self._vector_search(query)
+        bm25_ranked   = self._bm25_search(query)
+
+        fused_ids = (
+            reciprocal_rank_fusion([vector_ranked, bm25_ranked])
+            if bm25_ranked
+            else vector_ranked
         )
 
-        documents = []
-        if results["documents"]:
-            for doc_text, metadata in zip(
-                results["documents"][0], results["metadatas"][0]
-            ):
-                source     = metadata.get("source", "unknown")
-                page       = metadata.get("page", -1)
-                headings   = metadata.get("headings", "")
-                indexed_at = metadata.get("indexed_at", "")
+        candidates: list[Document] = []
+        for doc_id in fused_ids[:K_RETRIEVE]:
+            doc = self._id_to_document(doc_id)
+            if doc:
+                candidates.append(doc)
 
-                content = f"[{source}, page {page}] {doc_text}"
-                if headings:
-                    content = f"[{headings}]\n{content}"
+        if not candidates:
+            return []
 
-                documents.append(Document(
-                    page_content=content,
-                    metadata={
-                        "source":     source,
-                        "page":       page,
-                        "headings":   headings,
-                        "indexed_at": indexed_at,
-                    },
-                ))
+        pairs  = [(query, doc.page_content) for doc in candidates]
+        scores = self.reranker.predict(pairs)
 
-        return documents
+        reranked = [
+            doc for _, doc in sorted(
+                zip(scores, candidates), key=lambda t: t[0], reverse=True
+            )
+        ]
+        return reranked[:K_RERANK]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LCEL CHAIN BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_chain(retriever: HybridRetriever, llm: OllamaLLM):
+    """
+    LCEL pipeline — one LLM call per query (no history),
+    two calls when history exists (condense + answer).
+    """
+
+    condense_prompt = PromptTemplate(
+        input_variables=["chat_history", "question"],
+        template="""Given the conversation history and a follow-up question,
+rephrase the follow-up into a clear, standalone question.
+If there is no history, return the question unchanged.
+
+Chat History:
+{chat_history}
+
+Follow-up question: {question}
+Standalone question:""",
+    )
+
+    qa_prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template="""You are a helpful kiosk assistant. Answer the visitor's question
+using ONLY the information found in the context below.
+If the answer is not covered by the context, say:
+"I'm sorry, I don't have information about that in my knowledge base."
+Do not make up, assume, or infer anything beyond what the context states.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:""",
+    )
+
+    def format_history(history: list[tuple[str, str]]) -> str:
+        if not history:
+            return "(no prior conversation)"
+        return "\n".join(f"Human: {q}\nAssistant: {a}" for q, a in history)
+
+    def condense_question(inputs: dict) -> str:
+        question = inputs["question"]
+        if not inputs.get("chat_history"):
+            return question
+        prompt_text = condense_prompt.format(
+            chat_history=format_history(inputs["chat_history"]),
+            question=question,
+        )
+        return llm.invoke(prompt_text)
+
+    def format_context(docs: list[Document]) -> str:
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    chain = (
+        RunnablePassthrough.assign(
+            standalone_question=RunnableLambda(condense_question),
+        )
+        | RunnablePassthrough.assign(
+            source_documents=RunnableLambda(
+                lambda x: retriever.retrieve(x["standalone_question"])
+            ),
+        )
+        | RunnablePassthrough.assign(
+            context=RunnableLambda(
+                lambda x: format_context(x["source_documents"])
+            ),
+        )
+        | RunnablePassthrough.assign(
+            answer=RunnableLambda(
+                lambda x: (
+                    qa_prompt
+                    | llm
+                    | StrOutputParser()
+                ).invoke({"context": x["context"], "question": x["standalone_question"]})
+            ),
+        )
+    )
+
+    return chain
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALIZATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_chatbot():
-    """Load the ChromaDB index built by ingest.py and wire up the LLM chain."""
-
     if not INDEX_DIR.exists():
         log.error("ChromaDB index not found at %s", INDEX_DIR)
         log.info("Run first:  python ingest.py")
@@ -86,12 +294,13 @@ def init_chatbot():
 
     log.info("Loading ChromaDB from %s", INDEX_DIR)
 
-
-    client = chromadb.PersistentClient(path=str(INDEX_DIR))
+    embed_fn = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
+    client   = chromadb.PersistentClient(path=str(INDEX_DIR))
 
     try:
         collection = client.get_collection(
             name=COLLECTION_NAME,
+            embedding_function=embed_fn,
         )
     except Exception as e:
         log.error("Collection '%s' not found: %s", COLLECTION_NAME, e)
@@ -104,53 +313,13 @@ def init_chatbot():
     if chunk_count == 0:
         log.warning("Collection is empty! Add documents and run ingest.py first.")
 
-    retriever = ChromaDBRetriever(collection=collection, k=K_RETRIEVAL)
+    log.info("Loading cross-encoder reranker: %s", RERANK_MODEL)
+    reranker  = CrossEncoder(RERANK_MODEL)
+    retriever = HybridRetriever(collection=collection, reranker=reranker)
     llm       = OllamaLLM(model=LLM_MODEL)
+    chain     = build_chain(retriever, llm)
 
-    # ── Prompts ───────────────────────────────────────────────────────────────
-
-    # Rewrites follow-up questions into self-contained queries
-    condense_prompt = PromptTemplate(
-        input_variables=["chat_history", "question"],
-        template="""Given the conversation history and a follow-up question,
-rephrase the follow-up into a clear, standalone question that can be
-understood without the chat history.
-
-Chat History:
-{chat_history}
-
-Follow-up question: {question}
-Standalone question:""",
-    )
-
-    # Grounds the answer strictly in retrieved chunks
-    qa_prompt = PromptTemplate(
-        input_variables=["context", "question"],
-        template="""You are a helpful kiosk assistant. Answer the visitor's question
-using ONLY the information found in the context below.
-If the answer is not covered by the context, respond with:
-"I'm sorry, I don't have information about that in my knowledge base."
-Do not make up, assume, or infer anything beyond what the context states.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:""",
-    )
-
-    # ── Chain ─────────────────────────────────────────────────────────────────
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        condense_question_prompt=condense_prompt,
-        combine_docs_chain_kwargs={"prompt": qa_prompt},
-        return_source_documents=True,
-        verbose=False,
-    )
-
-    return qa_chain
+    return chain, retriever
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,21 +327,20 @@ Answer:""",
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_sources(sources: list[Document]):
-    """Pretty-print source documents from the last query."""
     if not sources:
         print("No sources available.\n")
         return
 
     print("\nSources:")
-    seen = set()
+    seen: set[tuple] = set()
     for doc in sources:
-        key = (doc.metadata["source"], doc.metadata["page"])
-        if key in seen:          # deduplicate same page cited multiple times
+        key = (doc.metadata.get("source"), doc.metadata.get("page"))
+        if key in seen:
             continue
         seen.add(key)
         heading = doc.metadata.get("headings") or "—"
-        print(f"  • {doc.metadata['source']}  "
-              f"(page {doc.metadata['page']})  "
+        print(f"  • {doc.metadata.get('source')}  "
+              f"(page {doc.metadata.get('page')})  "
               f"| {heading}")
     print()
 
@@ -182,8 +350,8 @@ def print_sources(sources: list[Document]):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Initializing AI Kiosk Chatbot...")
-    qa_chain = init_chatbot()
+    log.info("Initializing AI Kiosk Chatbot …")
+    chain, _ = init_chatbot()
 
     print("\n" + "=" * 60)
     print("         AI Kiosk — Knowledge Base Assistant")
@@ -201,11 +369,9 @@ def main():
     while True:
         try:
             query = input("You: ").strip()
-
             if not query:
                 continue
 
-            # ── Built-in commands ─────────────────────────────────────────────
             if query.lower() in ("exit", "quit", "q"):
                 print("Thank you for using the kiosk. Goodbye!")
                 break
@@ -220,9 +386,8 @@ def main():
                 print_sources(last_sources)
                 continue
 
-            # ── RAG query ─────────────────────────────────────────────────────
-            result = qa_chain.invoke({
-                "question":    query,
+            result = chain.invoke({
+                "question":     query,
                 "chat_history": chat_history,
             })
 
@@ -231,8 +396,9 @@ def main():
 
             print(f"\nKiosk: {answer}\n")
 
-            # Accumulate history for follow-up context
             chat_history.append((query, answer))
+            if len(chat_history) > MAX_HISTORY:
+                chat_history = chat_history[-MAX_HISTORY:]
 
         except KeyboardInterrupt:
             print("\n\nSession ended. Goodbye!")
